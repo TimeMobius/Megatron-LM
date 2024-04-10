@@ -13,10 +13,6 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TENorm,
-    get_cpu_offload_context,
-)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -111,26 +107,12 @@ class TransformerBlock(MegatronModule):
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
-        if get_cpu_offload_context is not None:
-            (
-                self.offload_context,
-                self.group_prefetch_offload_commit_async,
-            ) = get_cpu_offload_context(
-                self.config.cpu_offloading,
-                self.config.cpu_offloading_num_layers,
-                self.config.cpu_offloading_activations,
-                self.config.cpu_offloading_weights,
-            )
-            self.config._cpu_offloading_context = (
-                self.offload_context if self.config.cpu_offloading else None
-            )
-        else:
-            assert (
-                self.config.cpu_offloading == False
-            ), "CPU Offloading is enabled when TE is not present"
+        assert (
+            self.config.cpu_offloading == False
+        ), "CPU Offloading is enabled when TE is not present"
 
-            self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
-            self.config._cpu_offloading_context = None
+        self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
+        self.config._cpu_offloading_context = None
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -170,7 +152,8 @@ class TransformerBlock(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_layernorm = TENorm(
+            assert self.config.normalization == "LayerNorm"
+            self.final_layernorm = FusedLayerNorm(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
@@ -216,20 +199,7 @@ class TransformerBlock(MegatronModule):
 
         def checkpoint_handler(forward_func):
             if self.config.fp8:
-                from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
-
-                return te_checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    packed_seq_params,
-                )
+                assert False, "fp8 not supported"
             else:
                 return tensor_parallel.checkpoint(
                     forward_func,
@@ -327,29 +297,7 @@ class TransformerBlock(MegatronModule):
             rng_context = nullcontext()
 
         if self.config.fp8:
-            import transformer_engine  # To keep out TE dependency when not training in fp8
-
-            if self.config.fp8 == "e4m3":
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif self.config.fp8 == "hybrid":
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
-            else:
-                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-            fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
-                margin=self.config.fp8_margin,
-                interval=self.config.fp8_interval,
-                fp8_format=fp8_format,
-                amax_compute_algo=self.config.fp8_amax_compute_algo,
-                amax_history_len=self.config.fp8_amax_history_len,
-                override_linear_precision=(False, False, not self.config.fp8_wgrad),
-            )
-            fp8_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
-            fp8_context = transformer_engine.pytorch.fp8_autocast(
-                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
-            )
+            assert False, "fp8 not supported"
         else:
             fp8_context = nullcontext()
 
@@ -365,7 +313,7 @@ class TransformerBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
             else:
-                for layer in self.layers:
+                for i, layer in enumerate(self.layers):
                     with self.offload_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -376,6 +324,7 @@ class TransformerBlock(MegatronModule):
                             inference_params=inference_params,
                             packed_seq_params=packed_seq_params,
                         )
+                    print(f"layer {i} done")
 
                     if (
                         torch.is_grad_enabled()

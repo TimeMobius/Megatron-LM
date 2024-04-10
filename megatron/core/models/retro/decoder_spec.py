@@ -8,7 +8,6 @@ from megatron.core import parallel_state
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.decoder_attention import (
@@ -19,50 +18,11 @@ from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import CrossAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TEDotProductAttention,
-    TENorm,
-    TERowParallelLinear,
-)
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
 )
-
-
-def get_retro_decoder_layer_te_spec(
-    encoder_block_spec: typing.Union[ModuleSpec, TransformerBlockSubmodules, None] = None
-) -> ModuleSpec:
-    """Retro decoder TE spec (uses Transformer Engine components).
-
-    A Retro decoder layer uses custom attention and bias-dropout-add operators
-    to perform chunked-cross attention. Additionally, the first Retro decoder
-    layer instantiates an entire encoder transformer block. As such, the decoder
-    cross attention module takes an optional encoder block spec, which is only
-    provided for the first Retro decoder layer.
-
-    Args:
-        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
-
-    Returns:
-        A module spec with Transformer Engine modules.
-    """
-    spec = get_gpt_layer_with_transformer_engine_spec()
-    spec.submodules.pre_cross_attn_layernorm = TENorm
-    spec.submodules.cross_attention = ModuleSpec(
-        module=RetroDecoderCrossAttention,
-        params={"encoder_block_spec": encoder_block_spec,},
-        submodules=CrossAttentionSubmodules(
-            linear_q=TEColumnParallelLinear,
-            linear_kv=TEColumnParallelLinear,
-            core_attention=TEDotProductAttention,
-            linear_proj=TERowParallelLinear,
-        ),
-    )
-    spec.submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
-    return spec
 
 
 def get_retro_decoder_layer_local_spec(
@@ -86,7 +46,9 @@ def get_retro_decoder_layer_local_spec(
     spec.submodules.pre_cross_attn_layernorm = FusedLayerNorm
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={"encoder_block_spec": encoder_block_spec,},
+        params={
+            "encoder_block_spec": encoder_block_spec,
+        },
         submodules=CrossAttentionSubmodules(
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,
@@ -101,7 +63,6 @@ def get_retro_decoder_layer_local_spec(
 def get_retro_decoder_block_spec(
     config: RetroConfig, use_transformer_engine: bool
 ) -> TransformerBlockSubmodules:
-
     """Retro decoder block spec.
 
     Retro decoder block implementation details:
@@ -124,6 +85,7 @@ def get_retro_decoder_block_spec(
     assert (
         parallel_state.get_virtual_pipeline_model_parallel_world_size() is None
     ), "retro does not currently support virtual pipeline parallelism."
+    assert use_transformer_engine == False
     num_layers = get_num_layers_to_build(config)
 
     # Retro layer numbers.
@@ -131,16 +93,8 @@ def get_retro_decoder_block_spec(
     retro_layer_numbers = list(range(retro_layer_start, num_layers + 1, 3))
 
     # Layer specs.
-    gpt_layer_spec = (
-        get_gpt_layer_with_transformer_engine_spec()
-        if use_transformer_engine
-        else get_gpt_layer_local_spec()
-    )
-    get_retro_decoder_layer_spec = (
-        get_retro_decoder_layer_te_spec
-        if use_transformer_engine
-        else get_retro_decoder_layer_local_spec
-    )
+    gpt_layer_spec = get_gpt_layer_local_spec()
+    get_retro_decoder_layer_spec = get_retro_decoder_layer_local_spec
     retro_layer_spec = get_retro_decoder_layer_spec()
     retro_layer_spec_with_retriever = get_retro_decoder_layer_spec(
         get_retro_encoder_block_spec(config, use_transformer_engine)
